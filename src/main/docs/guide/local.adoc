@@ -44,6 +44,19 @@ crash-atomic transaction across both. Custom metadata providers, including datab
 responsible for their own metadata durability, cleanup lifecycle, and any higher-level transaction or compensation
 behavior.
 
+The local implementation supports the transactional upload-completion operation
+`ObjectStorageOperations.uploadAndCommit(UploadRequest, UploadCommitter)`. It invokes the api:objectstorage.UploadCommitter[]
+after the new bytes are durable and the ETag, content length, and last-modified time are finalized, but before releasing
+the per-object mutation lock or deleting the rollback snapshot. The callback receives
+api:objectstorage.CompletedUpload[], owns metadata persistence for this operation, and can return an application-defined
+result in api:objectstorage.CommittedUpload[]. Unlike the existing `upload` methods, `uploadAndCommit` does not first call
+api:objectstorage.metadata.ObjectMetadataOperations[] to save the new metadata. If the callback fails for a new object,
+the local provider removes the object and restores the previous metadata state through the metadata SPI. If it fails
+while replacing an object, the provider restores the previous bytes and metadata. This is an in-process compensation
+guarantee, not a crash-atomic transaction with an external metadata store. Other object storage providers may not
+support this operation or may provide a weaker rollback guarantee. To participate in local metadata compensation, the
+callback's authoritative store must also be represented by the configured `ObjectMetadataOperations` implementation.
+
 For compatibility with persistent local storage paths created by released older versions, the built-in local sidecar
 metadata provider also checks legacy per-bucket `.metadata` sidecars. New built-in sidecar metadata writes use the root
 `.mn-storage` layout, and deletes remove both the root sidecar and the legacy `.metadata` sidecar for the deleted object.

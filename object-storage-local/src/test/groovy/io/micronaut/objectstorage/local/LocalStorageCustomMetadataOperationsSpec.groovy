@@ -108,4 +108,33 @@ class LocalStorageCustomMetadataOperationsSpec extends AbstractLocalStorageCusto
             LocalStorageBucketOperations.deleteRecursively(rootDirectory)
         }
     }
+
+    void 'custom metadata operations prevent persistent sidecar writes during mutations'() {
+        given:
+        Path rootDirectory = Files.createTempDirectory('LocalStorageCustomMetadataOperationsSpec')
+        Path bucketPath = rootDirectory.resolve('default')
+        ApplicationContext context = null
+
+        when:
+        context = ApplicationContext.run([
+            'spec.name': AbstractLocalStorageCustomMetadataSpec.SPEC_NAME,
+            'micronaut.object-storage.local.default.path': bucketPath.toString()
+        ])
+        def localOperations = context.getBean(LocalStorageOperations)
+        UploadRequest request = UploadRequest.fromBytes('content'.bytes, 'custom.txt', 'text/plain')
+        request.metadata = [owner: 'application']
+        localOperations.upload(request)
+
+        then:
+        context.getBean(CustomObjectMetadataOperations).retrieve('custom.txt').present
+        !Files.exists(rootDirectory.resolve(LocalStorageOperations.INTERNAL_DIRECTORY)
+            .resolve(LocalStorageLayout.METADATA_DIRECTORY))
+        !Files.exists(bucketPath.resolve(LocalStorageOperations.LEGACY_METADATA_DIRECTORY))
+
+        cleanup:
+        context?.close()
+        if (Files.exists(rootDirectory)) {
+            LocalStorageBucketOperations.deleteRecursively(rootDirectory)
+        }
+    }
 }

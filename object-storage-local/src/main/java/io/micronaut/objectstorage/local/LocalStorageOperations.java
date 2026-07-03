@@ -19,8 +19,11 @@ import io.micronaut.context.annotation.EachBean;
 import io.micronaut.context.annotation.Parameter;
 import io.micronaut.context.annotation.Primary;
 import io.micronaut.context.annotation.Requires;
+import io.micronaut.objectstorage.CommittedUpload;
+import io.micronaut.objectstorage.CompletedUpload;
 import io.micronaut.objectstorage.ObjectStorageException;
 import io.micronaut.objectstorage.ObjectStorageOperations;
+import io.micronaut.objectstorage.UploadCommitter;
 import io.micronaut.objectstorage.configuration.ToggeableCondition;
 import io.micronaut.objectstorage.metadata.ObjectMetadataEntry;
 import io.micronaut.objectstorage.metadata.ObjectMetadataOperations;
@@ -41,6 +44,7 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashSet;
@@ -125,53 +129,86 @@ public class LocalStorageOperations implements ObjectStorageOperations<
     @Override
     @NonNull
     public UploadResponse<LocalStorageFile> upload(@NonNull UploadRequest request) {
-        return upload(request, localStorageFile -> { });
+        UploadCommitter<LocalStorageFile, LocalStorageFile> committer = completedUpload -> {
+            saveObjectMetadata(completedUpload);
+            return completedUpload.nativeResponse();
+        };
+        return uploadAndCommit(request, committer).uploadResponse();
     }
 
     @Override
     @NonNull
     public UploadResponse<LocalStorageFile> upload(@NonNull UploadRequest request,
                                                    @NonNull Consumer<LocalStorageFile> requestConsumer) {
+        UploadResponse<LocalStorageFile> response = upload(request);
+        requestConsumer.accept(response.getNativeResponse());
+        return response;
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>The callback owns metadata persistence for this operation and runs while the local object mutation lock and
+     * rollback snapshot are held. If it fails, the previous object bytes and configured metadata state are restored.</p>
+     */
+    @Override
+    @NonNull
+    public <R> CommittedUpload<LocalStorageFile, R> uploadAndCommit(@NonNull UploadRequest request,
+                                                                    @NonNull UploadCommitter<LocalStorageFile, R> committer) {
         String key = request.getKey();
         Path file = layout.objectPath(key);
         Lock bucketLock = LocalStorageLocks.bucketReadLock(layout.configuredBucketPath());
         ReentrantLock mutationLock = LocalStorageLocks.objectMutationLock(file);
-        LocalStorageFile localFile;
         bucketLock.lock();
         try {
             mutationLock.lock();
             try {
                 StoredFileSnapshot snapshot = snapshotStoredFile(file);
-                RuntimeException failure = null;
+                Throwable failure = null;
                 boolean preserveSnapshot = false;
+                Optional<ObjectMetadataEntry<Path>> previousMetadata;
+                try {
+                    previousMetadata = objectMetadataOperations.retrieve(key);
+                } catch (RuntimeException | Error e) {
+                    deleteSnapshot(snapshot, e, false);
+                    throw e;
+                }
                 try {
                     storeFile(file, request.getInputStream());
-                    objectMetadataOperations.save(new ObjectMetadataWrite(
+                    LocalStorageFile localFile = new LocalStorageFile(file);
+                    String eTag = UUID.randomUUID().toString();
+                    long contentLength = contentLength(file, key);
+                    Instant lastModified = lastModified(file, key);
+                    String contentType = request.getContentType().orElse(null);
+                    Map<String, String> metadata = request.getMetadata();
+                    Map<String, String> attributes = Map.of();
+                    UploadResponse<LocalStorageFile> response = UploadResponse.of(key, eTag, localFile);
+                    R commitResult = committer.commit(new CompletedUpload<>(
                         key,
-                        request.getMetadata(),
-                        Map.of(),
-                        request.getContentType().orElse(null),
-                        request.getContentSize().orElse(null),
-                        null,
-                        null
+                        eTag,
+                        contentLength,
+                        contentType,
+                        lastModified,
+                        metadata,
+                        attributes,
+                        localFile
                     ));
-                } catch (RuntimeException e) {
+                    return new CommittedUpload<>(response, commitResult);
+                } catch (RuntimeException | Error e) {
                     failure = e;
                     boolean restored = restoreStoredFileAfterFailure(file, snapshot, e);
+                    restoreObjectMetadataAfterFailure(key, previousMetadata, e);
                     preserveSnapshot = snapshot.exists() && !restored;
                     throw e;
                 } finally {
                     deleteSnapshot(snapshot, failure, preserveSnapshot);
                 }
-                localFile = new LocalStorageFile(file);
             } finally {
                 mutationLock.unlock();
             }
         } finally {
             bucketLock.unlock();
         }
-        requestConsumer.accept(localFile);
-        return UploadResponse.of(key, UUID.randomUUID().toString(), localFile);
     }
 
     @Override
@@ -428,6 +465,52 @@ public class LocalStorageOperations implements ObjectStorageOperations<
         );
     }
 
+    private void saveObjectMetadata(CompletedUpload<LocalStorageFile> completedUpload) {
+        objectMetadataOperations.save(new ObjectMetadataWrite(
+            completedUpload.key(),
+            completedUpload.metadata(),
+            completedUpload.attributes(),
+            completedUpload.contentType(),
+            completedUpload.contentLength(),
+            completedUpload.eTag(),
+            completedUpload.lastModified()
+        ));
+    }
+
+    private long contentLength(Path file, String key) {
+        try {
+            return Files.size(file);
+        } catch (IOException e) {
+            throw new ObjectStorageException("Error inspecting content length for object: " + key, e);
+        }
+    }
+
+    private Instant lastModified(Path file, String key) {
+        try {
+            return Files.getLastModifiedTime(file, LinkOption.NOFOLLOW_LINKS).toInstant();
+        } catch (IOException e) {
+            throw new ObjectStorageException("Error inspecting last-modified time for object: " + key, e);
+        }
+    }
+
+    private void restoreObjectMetadataAfterFailure(String key,
+                                                   Optional<ObjectMetadataEntry<Path>> previousMetadata,
+                                                   Throwable failure) {
+        try {
+            previousMetadata.ifPresentOrElse(entry -> objectMetadataOperations.save(new ObjectMetadataWrite(
+                key,
+                entry.metadata(),
+                entry.attributes(),
+                entry.contentType(),
+                entry.contentLength(),
+                entry.etag(),
+                entry.lastModified()
+            )), () -> objectMetadataOperations.delete(key));
+        } catch (RuntimeException | Error e) {
+            failure.addSuppressed(e);
+        }
+    }
+
     private StoredFileSnapshot snapshotStoredFile(Path file) {
         Path snapshotDirectory = layout.snapshotBucketDirectory();
         List<Path> cleanupDirectories = layout.snapshotCleanupDirectories();
@@ -474,9 +557,9 @@ public class LocalStorageOperations implements ObjectStorageOperations<
         return new StoredFileSnapshot(snapshot, cleanupDirectories);
     }
 
-    private boolean restoreStoredFileAfterFailure(Path file, StoredFileSnapshot snapshot, RuntimeException failure) {
+    private boolean restoreStoredFileAfterFailure(Path file, StoredFileSnapshot snapshot, Throwable failure) {
         try {
-            // Restore only the local file state; metadata-store transactionality belongs to the metadata implementation.
+            // Restore bytes first because the built-in metadata provider requires the object to exist when saving.
             if (snapshot.exists()) {
                 moveSnapshotReplacing(snapshot.path(), file);
             } else {
@@ -493,7 +576,7 @@ public class LocalStorageOperations implements ObjectStorageOperations<
         LocalStorageIoSupport.moveReplacing(snapshot, file);
     }
 
-    private void deleteSnapshot(StoredFileSnapshot snapshot, RuntimeException failure, boolean preserveSnapshot) {
+    private void deleteSnapshot(StoredFileSnapshot snapshot, Throwable failure, boolean preserveSnapshot) {
         if (preserveSnapshot) {
             return;
         }
