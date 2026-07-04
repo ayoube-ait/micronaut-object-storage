@@ -37,6 +37,9 @@ import java.util.Optional;
  * provider retries after consuming part of it. Providing the content length allows providers to
  * stream the request without buffering and is required by some provider operations.</p>
  *
+ * <p>Constructors that infer a content type from the key use only the key's file-name suffix. This
+ * is a convenience for populating object metadata and does not inspect or validate the stream contents.</p>
+ *
  * @since 3.1.0
  */
 public class InputStreamUploadRequest extends AbstractUploadRequest {
@@ -52,6 +55,7 @@ public class InputStreamUploadRequest extends AbstractUploadRequest {
 
     /**
      * Creates a request with an unknown content length and a content type inferred from the key.
+     * The inference is a convenience based on the key name and does not validate the stream contents.
      *
      * @param inputStream the source input stream.
      * @param key the key under which the object will be stored.
@@ -63,6 +67,7 @@ public class InputStreamUploadRequest extends AbstractUploadRequest {
 
     /**
      * Creates a request with a known content length and a content type inferred from the key.
+     * The inference is a convenience based on the key name and does not validate the stream contents.
      *
      * @param inputStream the source input stream.
      * @param key the key under which the object will be stored.

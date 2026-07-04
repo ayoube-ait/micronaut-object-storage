@@ -20,6 +20,9 @@ import org.jspecify.annotations.NonNull;
 /**
  * Commits application state associated with a completed upload.
  *
+ * <p>The storage provider invokes this callback synchronously and does not retry it. Implementations should commit
+ * application metadata transactionally and must not re-enter storage operations for the same physical key.</p>
+ *
  * @param <O> The provider-native upload response type.
  * @param <R> The application-defined commit result type.
  * @since 3.1.0
@@ -28,7 +31,8 @@ import org.jspecify.annotations.NonNull;
 public interface UploadCommitter<O, R> {
 
     /**
-     * Commits application state for a completed upload.
+     * Commits application state for a completed upload. Returning normally publishes the upload. Throwing rejects
+     * publication and asks the provider to attempt its documented compensation.
      *
      * @param upload The completed upload with finalized metadata.
      * @return The application-defined commit result.

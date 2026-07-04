@@ -2,14 +2,23 @@ package io.micronaut.objectstorage.local
 
 import io.micronaut.context.ApplicationContext
 import io.micronaut.objectstorage.CompletedUpload
+import io.micronaut.objectstorage.ObjectStorageException
 import io.micronaut.objectstorage.UploadCommitter
-import io.micronaut.objectstorage.metadata.ObjectMetadataWrite
 import io.micronaut.objectstorage.request.UploadRequest
 import spock.lang.Specification
 
 import java.nio.charset.StandardCharsets
+import java.nio.file.DirectoryNotEmptyException
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.Callable
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 class LocalStorageUploadCommitterSpec extends Specification {
 
@@ -36,14 +45,18 @@ class LocalStorageUploadCommitterSpec extends Specification {
         }
     }
 
-    void 'streamed upload committer receives finalized metadata and returns its result'() {
+    void 'streamed upload committer receives finalized storage information without sidecars'() {
         given:
         String key = 'streamed.txt'
-        UploadRequest request = new UnknownLengthUploadRequest('streamed content'.bytes, key, 'text/plain', [owner: 'test'])
-        CompletedUpload<LocalStorageOperations.LocalStorageFile> completedUpload = null
+        byte[] bytes = 'streamed content'.bytes
+        CloseTrackingInputStream inputStream = new CloseTrackingInputStream(bytes)
+        UploadRequest request = UploadRequest.fromInputStream(inputStream, key, 'text/plain', bytes.length + 100L)
+        request.metadata = [owner: 'application']
+        AtomicInteger callbackCalls = new AtomicInteger()
+        Map<String, CompletedUpload<LocalStorageOperations.LocalStorageFile>> externalMetadata = new ConcurrentHashMap<>()
         UploadCommitter<LocalStorageOperations.LocalStorageFile, String> committer = { completed ->
-            completedUpload = completed
-            metadataOperations.save(metadataWrite(completed))
+            callbackCalls.incrementAndGet()
+            externalMetadata.put(key, completed)
             'database-id'
         }
 
@@ -51,30 +64,55 @@ class LocalStorageUploadCommitterSpec extends Specification {
         def committed = operations.uploadAndCommit(request, committer)
 
         then:
+        callbackCalls.get() == 1
         committed.commitResult() == 'database-id'
         committed.uploadResponse().key == key
-        committed.uploadResponse().eTag == completedUpload.eTag()
-        committed.uploadResponse().nativeResponse == completedUpload.nativeResponse()
-        completedUpload.key() == key
-        completedUpload.contentLength() == 'streamed content'.bytes.length
-        completedUpload.contentType() == 'text/plain'
-        completedUpload.lastModified() != null
-        completedUpload.metadata() == [owner: 'test']
-        completedUpload.attributes() == [:]
+        def completed = externalMetadata.get(key)
+        committed.uploadResponse().eTag == completed.eTag()
+        committed.uploadResponse().nativeResponse == completed.nativeResponse().get()
+        completed.key() == key
+        completed.contentLength() == bytes.length
+        completed.contentType() == 'text/plain'
+        completed.storageTimestamp() != null
+        completed.metadata() == [owner: 'application']
+        completed.attributes() == [:]
+        inputStream.closed
 
-        and:
-        def storedMetadata = metadataOperations.retrieve(key).get()
-        storedMetadata.contentLength() == completedUpload.contentLength()
-        storedMetadata.contentType() == completedUpload.contentType()
-        storedMetadata.etag() == completedUpload.eTag()
-        storedMetadata.lastModified() == completedUpload.lastModified()
+        and: 'the committing path does not write local metadata sidecars'
+        !metadataOperations.retrieve(key).present
+        !Files.exists(metadataDirectory())
+        !Files.exists(bucketPath.resolve(LocalStorageOperations.LEGACY_METADATA_DIRECTORY))
     }
 
-    void 'failed committer removes a new object and its metadata'() {
+    void 'byte upload failure closes the stream and does not invoke the committer'() {
+        given:
+        String key = 'stream-failure.txt'
+        FailingInputStream inputStream = new FailingInputStream()
+        UploadRequest request = UploadRequest.fromInputStream(inputStream, key, 'text/plain', null)
+        AtomicInteger callbackCalls = new AtomicInteger()
+        UploadCommitter<LocalStorageOperations.LocalStorageFile, String> committer = { completed ->
+            callbackCalls.incrementAndGet()
+            'unexpected'
+        }
+
+        when:
+        operations.uploadAndCommit(request, committer)
+
+        then:
+        ObjectStorageException e = thrown()
+        e.message.startsWith('Error copying file to:')
+        callbackCalls.get() == 0
+        inputStream.closed
+        !operations.exists(key)
+        !metadataOperations.retrieve(key).present
+    }
+
+    void 'failed committer removes a new object without creating metadata sidecars'() {
         given:
         String key = 'new-failure.txt'
+        AtomicInteger callbackCalls = new AtomicInteger()
         UploadCommitter<LocalStorageOperations.LocalStorageFile, String> committer = { completed ->
-            metadataOperations.save(metadataWrite(completed))
+            callbackCalls.incrementAndGet()
             throw new IllegalStateException('commit failed')
         }
 
@@ -84,66 +122,143 @@ class LocalStorageUploadCommitterSpec extends Specification {
         then:
         IllegalStateException e = thrown()
         e.message == 'commit failed'
+        callbackCalls.get() == 1
         !operations.exists(key)
         !metadataOperations.retrieve(key).present
+        !Files.exists(metadataDirectory())
         !Files.exists(snapshotDirectory())
     }
 
-    void 'failed replacement committer restores previous bytes and metadata'() {
+    void 'failed replacement committer restores previous bytes and leaves application metadata unchanged'() {
         given:
         String key = 'replacement-failure.txt'
-        UploadRequest original = UploadRequest.fromBytes('original'.bytes, key, 'text/plain')
-        original.metadata = [version: 'original']
-        operations.upload(original)
-        def originalMetadata = metadataOperations.retrieve(key).get()
-        UploadRequest replacement = UploadRequest.fromBytes('replacement'.bytes, key, 'application/json')
-        replacement.metadata = [version: 'replacement']
-        UploadCommitter<LocalStorageOperations.LocalStorageFile, String> committer = { completed ->
-            metadataOperations.save(metadataWrite(completed))
+        Map<String, String> externalMetadata = new ConcurrentHashMap<>()
+        operations.uploadAndCommit(UploadRequest.fromBytes('original'.bytes, key, 'text/plain'), { completed ->
+            externalMetadata.put(key, 'original')
+            'original-id'
+        } as UploadCommitter<LocalStorageOperations.LocalStorageFile, String>)
+        AtomicInteger callbackCalls = new AtomicInteger()
+        UploadCommitter<LocalStorageOperations.LocalStorageFile, String> failingCommitter = { completed ->
+            callbackCalls.incrementAndGet()
             throw new IllegalStateException('commit failed')
         }
 
         when:
-        operations.uploadAndCommit(replacement, committer)
+        operations.uploadAndCommit(
+            UploadRequest.fromBytes('replacement'.bytes, key, 'application/json'),
+            failingCommitter
+        )
 
         then:
         IllegalStateException e = thrown()
         e.message == 'commit failed'
+        callbackCalls.get() == 1
         text(key) == 'original'
-        def restoredMetadata = metadataOperations.retrieve(key).get()
-        restoredMetadata.metadata() == [version: 'original']
-        restoredMetadata.contentType() == originalMetadata.contentType()
-        restoredMetadata.contentLength() == originalMetadata.contentLength()
-        restoredMetadata.etag() == originalMetadata.etag()
-        restoredMetadata.lastModified() == originalMetadata.lastModified()
+        externalMetadata.get(key) == 'original'
+        !metadataOperations.retrieve(key).present
         !Files.exists(snapshotDirectory())
     }
 
-    void 'successful replacement committer commits bytes and removes snapshot state'() {
+    void 'rollback failure is suppressed on the callback failure'() {
         given:
-        String key = 'replacement-success.txt'
-        operations.upload(UploadRequest.fromBytes('original'.bytes, key, 'text/plain'))
-        UploadRequest replacement = UploadRequest.fromBytes('replacement'.bytes, key, 'text/plain')
-        replacement.metadata = [version: 'replacement']
-        boolean snapshotPresentDuringCommit = false
-        UploadCommitter<LocalStorageOperations.LocalStorageFile, Integer> committer = { completed ->
-            snapshotPresentDuringCommit = Files.list(snapshotDirectory()).withCloseable { snapshots ->
-                snapshots.findAny().present
-            }
-            metadataOperations.save(metadataWrite(completed))
-            assert metadataOperations.retrieve(key).get().etag() == completed.eTag()
-            completed.contentLength() as Integer
+        String key = 'rollback-failure.txt'
+        UploadCommitter<LocalStorageOperations.LocalStorageFile, String> committer = { completed ->
+            Path objectPath = completed.nativeResponse().get().path()
+            Files.delete(objectPath)
+            Files.createDirectory(objectPath)
+            Files.writeString(objectPath.resolve('blocker'), 'prevent rollback')
+            throw new IllegalStateException('commit failed')
         }
 
         when:
-        def committed = operations.uploadAndCommit(replacement, committer)
+        operations.uploadAndCommit(UploadRequest.fromBytes('new'.bytes, key, 'text/plain'), committer)
 
         then:
-        committed.commitResult() == 'replacement'.bytes.length
-        snapshotPresentDuringCommit
+        IllegalStateException e = thrown()
+        e.message == 'commit failed'
+        e.suppressed.any { it instanceof DirectoryNotEmptyException }
+    }
+
+    void 'snapshot cleanup failure after callback success does not fail or roll back replacement'() {
+        given:
+        String key = 'snapshot-cleanup-failure.txt'
+        Map<String, String> externalMetadata = new ConcurrentHashMap<>()
+        operations.uploadAndCommit(UploadRequest.fromBytes('original'.bytes, key, 'text/plain'), { completed ->
+            externalMetadata.put(key, 'original')
+            'original-id'
+        } as UploadCommitter<LocalStorageOperations.LocalStorageFile, String>)
+        UploadCommitter<LocalStorageOperations.LocalStorageFile, String> committer = { completed ->
+            externalMetadata.put(key, 'replacement')
+            replaceSnapshotsWithNonEmptyDirectories(snapshotDirectory())
+            'replacement-id'
+        }
+
+        when:
+        def committed = operations.uploadAndCommit(
+            UploadRequest.fromBytes('replacement'.bytes, key, 'text/plain'),
+            committer
+        )
+
+        then:
+        committed.commitResult() == 'replacement-id'
         text(key) == 'replacement'
-        metadataOperations.retrieve(key).get().metadata() == [version: 'replacement']
+        externalMetadata.get(key) == 'replacement'
+        containsNonEmptyDirectory(snapshotDirectory())
+    }
+
+    void 'committing operations for the same physical key are serialized'() {
+        given:
+        String key = 'serialized.txt'
+        CountDownLatch firstCallbackStarted = new CountDownLatch(1)
+        CountDownLatch releaseFirstCallback = new CountDownLatch(1)
+        CountDownLatch secondReadStarted = new CountDownLatch(1)
+        AtomicInteger callbackCalls = new AtomicInteger()
+        ExecutorService executor = Executors.newFixedThreadPool(2)
+        Future<?> firstUpload = null
+        Future<?> secondUpload = null
+        ReadStartedInputStream secondInput = new ReadStartedInputStream('second'.bytes, secondReadStarted)
+
+        when:
+        firstUpload = executor.submit({
+            operations.uploadAndCommit(UploadRequest.fromBytes('first'.bytes, key, 'text/plain'), { completed ->
+                callbackCalls.incrementAndGet()
+                firstCallbackStarted.countDown()
+                await(releaseFirstCallback)
+                'first-id'
+            } as UploadCommitter<LocalStorageOperations.LocalStorageFile, String>)
+        } as Callable)
+
+        then:
+        firstCallbackStarted.await(5, TimeUnit.SECONDS)
+
+        when:
+        secondUpload = executor.submit({
+            operations.uploadAndCommit(
+                UploadRequest.fromInputStream(secondInput, key, 'text/plain', null),
+                { completed ->
+                    callbackCalls.incrementAndGet()
+                    'second-id'
+                } as UploadCommitter<LocalStorageOperations.LocalStorageFile, String>
+            )
+        } as Callable)
+
+        then:
+        !secondReadStarted.await(500, TimeUnit.MILLISECONDS)
+
+        when:
+        releaseFirstCallback.countDown()
+        firstUpload.get(5, TimeUnit.SECONDS)
+        secondUpload.get(5, TimeUnit.SECONDS)
+
+        then:
+        callbackCalls.get() == 2
+        text(key) == 'second'
+        secondInput.closed
         !Files.exists(snapshotDirectory())
+
+        cleanup:
+        releaseFirstCallback?.countDown()
+        executor?.shutdownNow()
     }
 
     private String text(String key) {
@@ -152,63 +267,80 @@ class LocalStorageUploadCommitterSpec extends Specification {
         }
     }
 
+    private Path metadataDirectory() {
+        rootDirectory.resolve(LocalStorageOperations.INTERNAL_DIRECTORY)
+            .resolve(LocalStorageLayout.METADATA_DIRECTORY)
+    }
+
     private Path snapshotDirectory() {
         rootDirectory.resolve(LocalStorageOperations.INTERNAL_DIRECTORY)
             .resolve(LocalStorageOperations.SNAPSHOT_DIRECTORY)
             .resolve('default')
     }
 
-    private static ObjectMetadataWrite metadataWrite(CompletedUpload<?> completed) {
-        new ObjectMetadataWrite(
-            completed.key(),
-            completed.metadata(),
-            completed.attributes(),
-            completed.contentType(),
-            completed.contentLength(),
-            completed.eTag(),
-            completed.lastModified()
-        )
+    private static void replaceSnapshotsWithNonEmptyDirectories(Path snapshotDirectory) {
+        List<Path> snapshots = Files.list(snapshotDirectory).withCloseable { stream ->
+            stream.toList()
+        }
+        snapshots.each { snapshot ->
+            Files.delete(snapshot)
+            Files.createDirectory(snapshot)
+            Files.writeString(snapshot.resolve('still-here'), 'snapshot')
+        }
     }
 
-    private static final class UnknownLengthUploadRequest implements UploadRequest {
-        private final byte[] bytes
-        private final String key
-        private final String contentType
-        private final Map<String, String> metadata
+    private static boolean containsNonEmptyDirectory(Path directory) {
+        Files.list(directory).withCloseable { stream ->
+            stream.anyMatch { path -> Files.isDirectory(path) && Files.exists(path.resolve('still-here')) }
+        }
+    }
 
-        private UnknownLengthUploadRequest(byte[] bytes,
-                                           String key,
-                                           String contentType,
-                                           Map<String, String> metadata) {
-            this.bytes = bytes
-            this.key = key
-            this.contentType = contentType
-            this.metadata = metadata
+    private static void await(CountDownLatch latch) {
+        if (!latch.await(5, TimeUnit.SECONDS)) {
+            throw new IllegalStateException('timed out waiting for callback release')
+        }
+    }
+
+    private static class CloseTrackingInputStream extends ByteArrayInputStream {
+        boolean closed
+
+        CloseTrackingInputStream(byte[] bytes) {
+            super(bytes)
         }
 
         @Override
-        Optional<String> getContentType() {
-            Optional.of(contentType)
+        void close() throws IOException {
+            closed = true
+            super.close()
+        }
+    }
+
+    private static final class ReadStartedInputStream extends CloseTrackingInputStream {
+        private final CountDownLatch readStarted
+
+        ReadStartedInputStream(byte[] bytes, CountDownLatch readStarted) {
+            super(bytes)
+            this.readStarted = readStarted
         }
 
         @Override
-        String getKey() {
-            key
+        synchronized int read(byte[] bytes, int offset, int length) {
+            readStarted.countDown()
+            super.read(bytes, offset, length)
+        }
+    }
+
+    private static final class FailingInputStream extends InputStream {
+        boolean closed
+
+        @Override
+        int read() throws IOException {
+            throw new IOException('stream failed')
         }
 
         @Override
-        Optional<Long> getContentSize() {
-            Optional.empty()
-        }
-
-        @Override
-        InputStream getInputStream() {
-            new ByteArrayInputStream(bytes)
-        }
-
-        @Override
-        Map<String, String> getMetadata() {
-            metadata
+        void close() throws IOException {
+            closed = true
         }
     }
 }

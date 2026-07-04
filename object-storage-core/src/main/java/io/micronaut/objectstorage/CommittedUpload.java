@@ -18,6 +18,8 @@ package io.micronaut.objectstorage;
 import io.micronaut.objectstorage.response.UploadResponse;
 import org.jspecify.annotations.NonNull;
 
+import java.util.Objects;
+
 /**
  * The provider upload response and the application-defined commit result.
  *
@@ -31,4 +33,11 @@ public record CommittedUpload<O, R>(
     @NonNull UploadResponse<O> uploadResponse,
     @NonNull R commitResult
 ) {
+    /**
+     * Creates a committed upload.
+     */
+    public CommittedUpload {
+        uploadResponse = Objects.requireNonNull(uploadResponse, "uploadResponse");
+        commitResult = Objects.requireNonNull(commitResult, "commitResult");
+    }
 }

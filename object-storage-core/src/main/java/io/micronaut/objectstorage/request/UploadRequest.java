@@ -75,7 +75,8 @@ public interface UploadRequest {
     }
 
     /**
-     * Creates an upload request backed by an input stream whose content length is unknown.
+     * Creates an upload request backed by an input stream whose content length is unknown. The content type inferred
+     * from the key is a file-name convenience and does not inspect or validate the stream contents.
      *
      * @param inputStream the source input stream.
      * @param key the key under which the object will be stored ({@code path/to/file}).
@@ -90,7 +91,8 @@ public interface UploadRequest {
     /**
      * Creates an upload request backed by an input stream with a known content length.
      * Providing the content length allows providers to stream the request without buffering and is
-     * required by some provider operations.
+     * required by some provider operations. The content type inferred from the key is a file-name
+     * convenience and does not inspect or validate the stream contents.
      *
      * @param inputStream the source input stream.
      * @param key the key under which the object will be stored ({@code path/to/file}).

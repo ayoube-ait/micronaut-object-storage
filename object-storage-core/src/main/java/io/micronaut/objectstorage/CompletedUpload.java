@@ -20,6 +20,8 @@ import org.jspecify.annotations.Nullable;
 
 import java.time.Instant;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 
 /**
  * Finalized information about a completed object upload.
@@ -27,11 +29,13 @@ import java.util.Map;
  * @param key The object key.
  * @param eTag The final entity tag.
  * @param contentLength The final content length.
- * @param contentType The content type, or {@code null} if none was supplied.
- * @param lastModified The final last-modified instant.
+ * @param contentType The content type associated with the stored object, or {@code null} when unknown. Depending on the
+ * provider and request type, this can be explicitly declared, inferred from the key as a convenience, or returned by
+ * the provider. It does not represent validation of the object bytes.
+ * @param storageTimestamp The provider's storage timestamp. This is not an application or database timestamp.
  * @param metadata User metadata.
  * @param attributes Portable custom attributes.
- * @param nativeResponse The provider-native upload response.
+ * @param nativeResponse The optional provider-native upload response.
  * @param <O> The provider-native upload response type.
  * @since 3.1.0
  */
@@ -40,16 +44,20 @@ public record CompletedUpload<O>(
     @NonNull String eTag,
     long contentLength,
     @Nullable String contentType,
-    @NonNull Instant lastModified,
+    @NonNull Instant storageTimestamp,
     @NonNull Map<String, String> metadata,
     @NonNull Map<String, String> attributes,
-    @NonNull O nativeResponse
+    @NonNull Optional<O> nativeResponse
 ) {
     /**
      * Creates a completed upload and protects its metadata maps from subsequent mutation.
      */
     public CompletedUpload {
-        metadata = Map.copyOf(metadata);
-        attributes = Map.copyOf(attributes);
+        key = Objects.requireNonNull(key, "key");
+        eTag = Objects.requireNonNull(eTag, "eTag");
+        storageTimestamp = Objects.requireNonNull(storageTimestamp, "storageTimestamp");
+        metadata = Map.copyOf(Objects.requireNonNull(metadata, "metadata"));
+        attributes = Map.copyOf(Objects.requireNonNull(attributes, "attributes"));
+        nativeResponse = Objects.requireNonNull(nativeResponse, "nativeResponse");
     }
 }

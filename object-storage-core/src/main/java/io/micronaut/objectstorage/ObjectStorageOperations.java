@@ -65,29 +65,6 @@ public interface ObjectStorageOperations<I, O, D> {
     UploadResponse<O> upload(@NonNull UploadRequest request, @NonNull Consumer<I> requestConsumer);
 
     /**
-     * Uploads an object and invokes an application commit callback after the provider has finalized
-     * the upload metadata.
-     *
-     * <p>Implementations that support this operation document their rollback guarantee. The default
-     * implementation does not upload the object and reports that the operation is unsupported.</p>
-     *
-     * @param request The upload request.
-     * @param committer The application commit callback.
-     * @param <R> The application-defined commit result type.
-     * @return The provider upload response and application commit result.
-     * @throws ObjectStorageException if there was a failure storing the object
-     * @throws RuntimeException if the application commit callback fails
-     * @throws UnsupportedOperationException if the provider does not support transactional upload completion
-     * @since 3.1.0
-     */
-    @Blocking
-    @NonNull
-    default <R> CommittedUpload<O, R> uploadAndCommit(@NonNull UploadRequest request,
-                                                      @NonNull UploadCommitter<O, R> committer) {
-        throw new UnsupportedOperationException("Transactional upload completion is not supported by this provider");
-    }
-
-    /**
      * Gets the object from object storage.
      *
      * @param key the object path in the format {@code /foo/bar/file}
