@@ -199,15 +199,6 @@ final class LocalStorageLayout {
         );
     }
 
-    List<Path> snapshotCleanupDirectories() {
-        Path snapshotBucketDirectory = snapshotBucketDirectory();
-        return List.of(
-            snapshotBucketDirectory,
-            snapshotBucketDirectory.getParent(),
-            rootInternalDirectory()
-        );
-    }
-
     private Path legacyObjectMetadataFile(String key) {
         Path metadataRoot = bucketPath.resolve(LEGACY_METADATA_DIRECTORY);
         LocalStorageIoSupport.rejectSymbolicLinks(bucketPath.normalize(), metadataRoot.normalize());

@@ -14,6 +14,8 @@ import java.nio.file.Path
 import java.util.concurrent.Callable
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
@@ -126,7 +128,7 @@ class LocalStorageUploadCommitterSpec extends Specification {
         !operations.exists(key)
         !metadataOperations.retrieve(key).present
         !Files.exists(metadataDirectory())
-        !Files.exists(snapshotDirectory())
+        snapshotFiles().empty
     }
 
     void 'failed replacement committer restores previous bytes and leaves application metadata unchanged'() {
@@ -156,7 +158,7 @@ class LocalStorageUploadCommitterSpec extends Specification {
         text(key) == 'original'
         externalMetadata.get(key) == 'original'
         !metadataOperations.retrieve(key).present
-        !Files.exists(snapshotDirectory())
+        snapshotFiles().empty
     }
 
     void 'rollback failure is suppressed on the callback failure'() {
@@ -254,10 +256,160 @@ class LocalStorageUploadCommitterSpec extends Specification {
         callbackCalls.get() == 2
         text(key) == 'second'
         secondInput.closed
-        !Files.exists(snapshotDirectory())
+        snapshotFiles().empty
 
         cleanup:
         releaseFirstCallback?.countDown()
+        executor?.shutdownNow()
+    }
+
+    void 'concurrent committing uploads for distinct keys do not race over snapshot storage'() {
+        given:
+        int operationCount = 20
+        int rounds = 10
+        ExecutorService executor = Executors.newFixedThreadPool(operationCount)
+        Map<String, String> expectedContent = [:]
+        List<String> commitResults = []
+
+        when:
+        rounds.times { round ->
+            CyclicBarrier startBarrier = new CyclicBarrier(operationCount)
+            List<Future<String>> uploads = (0..<operationCount).collect { index ->
+                String key = "concurrent-new/${round}/${index}.txt"
+                String content = "new-${round}-${index}"
+                expectedContent.put(key, content)
+                executor.submit({
+                    startBarrier.await(5, TimeUnit.SECONDS)
+                    operations.uploadAndCommit(
+                        UploadRequest.fromBytes(content.bytes, key, 'text/plain'),
+                        { completed -> "committed-${completed.key()}" } as UploadCommitter<LocalStorageOperations.LocalStorageFile, String>
+                    ).commitResult()
+                } as Callable<String>)
+            }
+            uploads.each { upload ->
+                commitResults.add(upload.get(10, TimeUnit.SECONDS))
+            }
+        }
+
+        then:
+        commitResults.size() == operationCount * rounds
+        expectedContent.every { key, content -> text(key) == content }
+        snapshotFiles().empty
+
+        cleanup:
+        executor?.shutdownNow()
+    }
+
+    void 'concurrent replacements for distinct keys do not race over snapshot storage'() {
+        given:
+        int operationCount = 20
+        int rounds = 5
+        ExecutorService executor = Executors.newFixedThreadPool(operationCount)
+        List<String> keys = (0..<operationCount).collect { index -> "concurrent-replacement/${index}.txt" }
+        keys.each { key ->
+            operations.uploadAndCommit(
+                UploadRequest.fromBytes("original-${key}".bytes, key, 'text/plain'),
+                { completed -> "created-${completed.key()}" } as UploadCommitter<LocalStorageOperations.LocalStorageFile, String>
+            )
+        }
+        Map<String, String> expectedContent = [:]
+
+        when:
+        rounds.times { round ->
+            CyclicBarrier startBarrier = new CyclicBarrier(operationCount)
+            List<Future<String>> replacements = keys.withIndex().collect { key, index ->
+                String content = "replacement-${round}-${index}"
+                expectedContent.put(key, content)
+                executor.submit({
+                    startBarrier.await(5, TimeUnit.SECONDS)
+                    operations.uploadAndCommit(
+                        UploadRequest.fromBytes(content.bytes, key, 'text/plain'),
+                        { completed -> "replaced-${completed.key()}" } as UploadCommitter<LocalStorageOperations.LocalStorageFile, String>
+                    ).commitResult()
+                } as Callable<String>)
+            }
+            replacements.each { replacement ->
+                replacement.get(10, TimeUnit.SECONDS)
+            }
+        }
+
+        then:
+        expectedContent.every { key, content -> text(key) == content }
+        snapshotFiles().empty
+
+        cleanup:
+        executor?.shutdownNow()
+    }
+
+    void 'failed callback cleanup cannot remove another keys active snapshot'() {
+        given:
+        String failingKey = 'snapshot-isolation/failing.txt'
+        String successfulKey = keyUsingDifferentMutationLock(failingKey, 'snapshot-isolation/successful')
+        operations.uploadAndCommit(
+            UploadRequest.fromBytes('failing-original'.bytes, failingKey, 'text/plain'),
+            { completed -> 'failing-created' } as UploadCommitter<LocalStorageOperations.LocalStorageFile, String>
+        )
+        operations.uploadAndCommit(
+            UploadRequest.fromBytes('successful-original'.bytes, successfulKey, 'text/plain'),
+            { completed -> 'successful-created' } as UploadCommitter<LocalStorageOperations.LocalStorageFile, String>
+        )
+        CountDownLatch failingCallbackStarted = new CountDownLatch(1)
+        CountDownLatch successfulCallbackStarted = new CountDownLatch(1)
+        CountDownLatch allowFailure = new CountDownLatch(1)
+        CountDownLatch allowSuccess = new CountDownLatch(1)
+        ExecutorService executor = Executors.newFixedThreadPool(2)
+        Future<?> failingUpload = executor.submit({
+            operations.uploadAndCommit(
+                UploadRequest.fromBytes('failing-replacement'.bytes, failingKey, 'text/plain'),
+                { completed ->
+                    failingCallbackStarted.countDown()
+                    await(allowFailure)
+                    throw new IllegalStateException('commit failed')
+                } as UploadCommitter<LocalStorageOperations.LocalStorageFile, String>
+            )
+        } as Callable)
+        Future<?> successfulUpload = executor.submit({
+            operations.uploadAndCommit(
+                UploadRequest.fromBytes('successful-replacement'.bytes, successfulKey, 'text/plain'),
+                { completed ->
+                    successfulCallbackStarted.countDown()
+                    await(allowSuccess)
+                    'successful-id'
+                } as UploadCommitter<LocalStorageOperations.LocalStorageFile, String>
+            )
+        } as Callable)
+
+        expect:
+        failingCallbackStarted.await(5, TimeUnit.SECONDS)
+        successfulCallbackStarted.await(5, TimeUnit.SECONDS)
+        snapshotFiles().size() == 2
+
+        when:
+        allowFailure.countDown()
+        failingUpload.get(5, TimeUnit.SECONDS)
+
+        then:
+        ExecutionException e = thrown()
+        e.cause instanceof IllegalStateException
+        e.cause.message == 'commit failed'
+
+        and: 'the successful upload remains active with its own snapshot'
+        !successfulUpload.done
+        snapshotFiles().size() == 1
+        text(failingKey) == 'failing-original'
+
+        when:
+        allowSuccess.countDown()
+        def committed = successfulUpload.get(5, TimeUnit.SECONDS)
+
+        then:
+        committed.commitResult() == 'successful-id'
+        text(successfulKey) == 'successful-replacement'
+        snapshotFiles().empty
+
+        cleanup:
+        allowFailure?.countDown()
+        allowSuccess?.countDown()
         executor?.shutdownNow()
     }
 
@@ -276,6 +428,28 @@ class LocalStorageUploadCommitterSpec extends Specification {
         rootDirectory.resolve(LocalStorageOperations.INTERNAL_DIRECTORY)
             .resolve(LocalStorageOperations.SNAPSHOT_DIRECTORY)
             .resolve('default')
+    }
+
+    private List<Path> snapshotFiles() {
+        Path directory = snapshotDirectory()
+        if (!Files.exists(directory)) {
+            return []
+        }
+        Files.walk(directory).withCloseable { stream ->
+            stream.filter { path ->
+                Files.isRegularFile(path) && path.fileName.toString().endsWith('.snapshot')
+            }.toList()
+        }
+    }
+
+    private String keyUsingDifferentMutationLock(String key, String candidatePrefix) {
+        int existingIndex = LocalStorageLocks.objectMutationLockIndex(bucketPath.resolve(key))
+        int suffix = 0
+        String candidate
+        do {
+            candidate = "${candidatePrefix}-${suffix++}.txt"
+        } while (LocalStorageLocks.objectMutationLockIndex(bucketPath.resolve(candidate)) == existingIndex)
+        candidate
     }
 
     private static void replaceSnapshotsWithNonEmptyDirectories(Path snapshotDirectory) {

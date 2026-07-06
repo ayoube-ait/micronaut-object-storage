@@ -238,7 +238,7 @@ class LocalStorageCustomMetadataDurabilitySpec extends AbstractLocalStorageCusto
         operations.exists('destination.txt')
         def entry = operations.retrieve('destination.txt').get()
         new String(entry.inputStream.readAllBytes(), StandardCharsets.UTF_8) == 'destination'
-        !Files.exists(snapshotBucketDirectory(entry.nativeEntry))
+        !containsSnapshotFiles(snapshotBucketDirectory(entry.nativeEntry))
     }
 
     void 'failed copy metadata save cannot restore over concurrent destination upload'() {
@@ -309,7 +309,7 @@ class LocalStorageCustomMetadataDurabilitySpec extends AbstractLocalStorageCusto
         operations.exists('delete-failure.txt')
         def entry = operations.retrieve('delete-failure.txt').get()
         new String(entry.inputStream.readAllBytes(), StandardCharsets.UTF_8) == 'content'
-        !Files.exists(snapshotBucketDirectory(entry.nativeEntry))
+        !containsSnapshotFiles(snapshotBucketDirectory(entry.nativeEntry))
     }
 
     private static void replaceSnapshotsWithNonEmptyDirectories(Path snapshotDirectory) {
@@ -326,6 +326,17 @@ class LocalStorageCustomMetadataDurabilitySpec extends AbstractLocalStorageCusto
     private static boolean containsNonEmptyDirectory(Path directory) {
         Files.list(directory).withCloseable { stream ->
             stream.anyMatch { path -> Files.isDirectory(path) && Files.exists(path.resolve('still-here')) }
+        }
+    }
+
+    private static boolean containsSnapshotFiles(Path directory) {
+        if (!Files.exists(directory)) {
+            return false
+        }
+        Files.walk(directory).withCloseable { stream ->
+            stream.anyMatch { path ->
+                Files.isRegularFile(path) && path.fileName.toString().endsWith('.snapshot')
+            }
         }
     }
 
